@@ -1,0 +1,4 @@
+data/clean/
+data/raw/*
+!data/raw/curve3pool_hourly.csv
+__pycache__/
