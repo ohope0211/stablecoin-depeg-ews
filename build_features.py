@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_features.py (v3: them dex_imbalance tu Curve 3pool) - BUOC 5: tinh bien dan xuat va gan nhan depeg.
+build_features.py (v4: them dex_imbalance + nguong dong theo thanh khoan) - BUOC 5: tinh bien dan xuat va gan nhan depeg.
 
 Dau vao : data/clean/panel_base.csv   (tu build_panel.py)
 Dau ra  : data/clean/dataset_hourly.csv
@@ -23,6 +23,10 @@ CAC BIEN THE NHAN
   depeg_down_label_h*  : chi lech xuong (price < 1-tau), tau=0.5%
   depeg_tau1_label_h*  : hai phia, tau=1%     (kiem tra do ben)
   depeg_tau2_label_h*  : hai phia, tau=2%     (chi ~6 su kien: chu yeu de mo ta)
+  depeg_dyn_label_h*   : hai phia, NGUONG DONG theo thanh khoan: tau_t = clip(k x trung vi bien do gio (high-low)/gia
+                         trong 30 ngay TRUOC gio t, 0.5%, 2%). Coin/giai doan thanh khoan mong (bien do gio lon,
+                         nhieu nhieu) co nguong cao hon; coin thanh khoan tot giu nguong san 0.5%. Chi dung qua khu.
+                         Doi he so:  python build_features.py --k 8
 
 Chay:   python build_features.py
 Roi dan TOAN BO output cho Claude.
@@ -34,11 +38,13 @@ import pandas as pd
 
 CLEAN = os.path.join("data", "clean")
 HORIZONS = [1, 6, 24]
+DYN_K, DYN_FLOOR, DYN_CAP, DYN_WINDOW = 40.0, 0.005, 0.02, 720  # nguong dong: k, san, tran, cua so (gio)
 VARIANTS = [  # (hau to cot, tau, phia, tien to nhan)
     ("", 0.005, "both", "depeg_label_h"),
     ("_down", 0.005, "down", "depeg_down_label_h"),
     ("_tau1", 0.01, "both", "depeg_tau1_label_h"),
     ("_tau2", 0.02, "both", "depeg_tau2_label_h"),
+    ("_dyn", "dyn", "both", "depeg_dyn_label_h"),  # tau = cot tau_dyn (thay doi theo gio)
 ]
 
 
@@ -104,6 +110,10 @@ def add_features(d):
     sd = lv.rolling(720, min_periods=168).std()
     d["volume_z"] = (lv - mu) / sd.replace(0, np.nan)  # volume chuan hoa theo tung coin (30 ngay)
     d["illiq_range_24h"] = d["range_hl"].rolling(24, min_periods=12).mean()  # proxy phi thanh khoan
+    # Nguong dong theo thanh khoan: trung vi bien do gio trong 30 ngay TRUOC gio t (shift(1) -> khong dung gio t,
+    # nen mot cu depeg o gio t khong tu nang nguong cua chinh no). Thieu du lieu -> dung nguong san.
+    d["illiq_med_30d"] = d["range_hl"].rolling(DYN_WINDOW, min_periods=168).median().shift(1)
+    d["tau_dyn"] = (DYN_K * d["illiq_med_30d"]).fillna(0).clip(lower=DYN_FLOOR, upper=DYN_CAP)
 
     d["supply"] = d["supply_usd_lag1"]
     d["supply_change"] = d["supply"] / d["supply"].shift(24) - 1
@@ -126,7 +136,8 @@ def add_features(d):
 def add_labels(d):
     valid = d["price"].notna()
     for tag, tau, side, prefix in VARIANTS:
-        breach, onset, in_depeg = episode_flags(d["price"], tau, side)
+        t = d["tau_dyn"] if isinstance(tau, str) else tau
+        breach, onset, in_depeg = episode_flags(d["price"], t, side)
         d["onset" + tag] = onset
         d["in_depeg" + tag] = in_depeg
         for h in HORIZONS:
@@ -145,7 +156,57 @@ def usable(ds, tag, prefix):
     return ds[(~ds["in_depeg" + tag]) & ds[f"{prefix}24"].notna()]
 
 
+def print_dynamic_report(ds, ks=(10, 25, 40, 60, 100)):
+    """Muc 5 + 6: do nhay theo he so k va nhung su kien chinh bi nguong dong loai."""
+    print("\n=== 5. NGUONG DONG THEO THANH KHOAN: tau_t = clip(k x trung vi bien do gio 30 ngay truoc, "
+          f"{DYN_FLOOR * 100:g}%, {DYN_CAP * 100:g}%) ===")
+    print("   (tau_dyn theo coin, don vi %: trung vi / phan vi 90 / lon nhat; san = 0.5%)")
+    for coin, g in ds.groupby("stablecoin", sort=False):
+        t = g["tau_dyn"] * 100
+        print(f"   {coin:6s} {t.median():5.2f} / {t.quantile(.9):5.2f} / {t.max():5.2f}   "
+              f"su kien nhan chinh {int(g['onset'].sum())} -> nhan dong {int(g['onset_dyn'].sum())}")
+    print("   do nhay theo k (k lon = nguong cao = it su kien). So su kien theo coin:")
+    coins = list(ds["stablecoin"].unique())
+    print("     k   " + " ".join(f"{c:>6s}" for c in coins) + " | tong  dung_duoc | duong h1  h6  h24")
+    for k in sorted(set(ks) | {DYN_K}):
+        n_use = 0
+        per = {}
+        pos = [0, 0, 0]
+        for coin, g in ds.groupby("stablecoin", sort=False):
+            tau = (k * g["illiq_med_30d"]).fillna(0).clip(lower=DYN_FLOOR, upper=DYN_CAP)
+            _, onset, in_dep = episode_flags(g["price"], tau)
+            valid = g["price"].notna()
+            labs = {h: forward_label(onset, valid, h) for h in HORIZONS}
+            use = (~in_dep) & labs[24].notna()
+            per[coin] = int(onset.sum())
+            n_use += int(use.sum())
+            for j, h in enumerate(HORIZONS):
+                pos[j] += int(((labs[h] == 1) & use).sum())
+        mark = "  <- dang dung" if k == DYN_K else ""
+        print(f"   {k:4g}  " + " ".join(f"{per[c]:6d}" for c in coins)
+              + f" | {sum(per.values()):4d} {n_use:9d} | {pos[0]:6d} {pos[1]:4d} {pos[2]:4d}{mark}")
+
+    print("\n=== 6. SU KIEN CUA NHAN CHINH BI NGUONG DONG LOAI / DOI THOI DIEM ===")
+    key = lambda x: set(zip(x["timestamp"], x["stablecoin"]))
+    main_on, dyn_on = ds[ds["onset"]], ds[ds["onset_dyn"]]
+    removed = main_on[[k not in key(dyn_on) for k in zip(main_on["timestamp"], main_on["stablecoin"])]]
+    added = dyn_on[[k not in key(main_on) for k in zip(dyn_on["timestamp"], dyn_on["stablecoin"])]]
+    print("   a) su kien nhan chinh KHONG con trong nhan dong (do dong gia, tau_dyn luc do):")
+    if removed.empty:
+        print("      (khong co)")
+    for _, r in removed.sort_values("timestamp").iterrows():
+        print(f"      {r['timestamp']:%Y-%m-%d %H:%M}  {r['stablecoin']:6s} gia={r['price']:.4f}  tau_dyn={r['tau_dyn'] * 100:.2f}%")
+    print(f"   b) onset chi co o nhan dong (thuong la dot cu bi tach/dich thoi diem): {len(added)} su kien")
+    for _, r in added.sort_values("timestamp").head(10).iterrows():
+        print(f"      {r['timestamp']:%Y-%m-%d %H:%M}  {r['stablecoin']:6s} gia={r['price']:.4f}  tau_dyn={r['tau_dyn'] * 100:.2f}%")
+
+
 def main():
+    global DYN_K
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--k", type=float, default=DYN_K, help="he so nguong dong (mac dinh 40)")
+    DYN_K = ap.parse_args().k
     path = os.path.join(CLEAN, "panel_base.csv")
     if not os.path.exists(path):
         print("Chua co data/clean/panel_base.csv, hay chay build_panel.py truoc.")
@@ -179,7 +240,8 @@ def main():
     for tag, tau, side, prefix in VARIANTS:
         u = usable(ds, tag, prefix)
         pos = [int((u[f"{prefix}{h}"] == 1).sum()) for h in HORIZONS]
-        name = f"{prefix}* (tau={tau * 100:g}%, {'hai phia' if side == 'both' else 'chi xuong'})"
+        tau_txt = f"dong k={DYN_K:g}" if isinstance(tau, str) else f"{tau * 100:g}%"
+        name = f"{prefix}* (tau={tau_txt}, {'hai phia' if side == 'both' else 'chi xuong'})"
         print(f"   {name:36s} {int(ds['onset' + tag].sum()):4d}  {len(u):9d} | {pos[0]:7d}  {pos[1]:8d}  {pos[2]:9d}")
     print("   (so dong duong h1 nho hon so su_kien vi dong ngay truoc su kien co the dang trong in_depeg)")
 
@@ -205,6 +267,9 @@ def main():
             "btc_vol", "eth_vol", "illiq_range_24h", "dex_imbalance"]
     for coin, g in ds.groupby("stablecoin", sort=False):
         print(f"   {coin:6s} " + " | ".join(f"{c}={g[c].isna().mean() * 100:.0f}%" for c in cols))
+
+
+    print_dynamic_report(ds)
 
     print("\nXong. Dan toan bo output cho Claude.")
 
